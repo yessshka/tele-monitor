@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import os
 import re
 import subprocess
 import time
@@ -13,10 +14,9 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- НАСТРОЙКИ ---
-# Вставьте сюда токен вашего Telegram-бота
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-# Вставьте сюда ваш Chat ID, куда бот будет отправлять сообщения
-CHAT_ID = "YOUR_CHAT_ID"
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # Словарь для сопоставления IP-адресов с именами клиентов
 PEER_NAMES = {
@@ -234,8 +234,8 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Основная функция для запуска бота."""
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or CHAT_ID == "YOUR_CHAT_ID":
-        logger.error("Пожалуйста, укажите BOT_TOKEN и CHAT_ID в начале скрипта.")
+    if not BOT_TOKEN or CHAT_ID:
+        logger.error("Пожалуйста, укажите BOT_TOKEN и CHAT_ID в .env")
         return
 
     application = Application.builder().token(BOT_TOKEN).build()
