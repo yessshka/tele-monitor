@@ -17,3 +17,27 @@ cd tele-monitor
 python3 -m venv bot
 source bot/bin/activate
 pip install -r requirements.txt
+```
+
+## Создайте .env:
+```dotenv
+BOT_TOKEN=ваш_токен
+CHAT_ID=ваш_чат_id
+```
+
+## ⚙️ Автозапуск через systemd
+```bash
+sudo cp wg_bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wg_bot
+```
+
+## 🧪 Команды бота
+/start        Приветствие и справка
+/monitoring	  Текущие метрики CPU, RAM, сеть
+/active_wg	  Список активных VPN-клиентов
+
+## 📦 Зависимости
+python-telegram-bot
+psutil
+python-dotenv
