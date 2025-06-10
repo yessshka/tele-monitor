@@ -12,7 +12,7 @@
 ## 🚀 Установка
 
 ```bash
-git clone https://github.com/yourusername/tele-monitor.git
+git clone https://github.com/yessshka/tele-monitor.git
 cd tele-monitor
 python3 -m venv bot
 source bot/bin/activate
