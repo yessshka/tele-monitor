@@ -1,0 +1,16 @@
+[Unit]
+Description=Tele-Monitor Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/usr/tele-monitor
+ExecStart=/home/usr/tele-monitor/bot/bin/python /home/usr/tele-monitor/main.py
+Restart=on-failure
+Environment=PATH=/home/usr/tele-monitor/bot/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
