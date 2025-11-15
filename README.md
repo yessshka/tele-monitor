@@ -42,25 +42,25 @@
 
 ## 🚀 Установка
 
-###1. Клонирование репозитория (или просто скачайте ZIP-архив и загрузите файлы на сервер)
+### 1. Клонирование репозитория (или просто скачайте ZIP-архив и загрузите файлы на сервер)
 
 ```bash
 git clone https://github.com/yessshka/tele-monitor-v2.0.git
 cd tele-monitor
 ```
-###2. Создание виртуального окружения
+### 2. Создание виртуального окружения
 
 ```bash
 python3 -m venv bot
 source bot/bin/activate
 ```
-###3. Установка зависимостей
+### 3. Установка зависимостей
 
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
-###4. Настройка конфигурации (секреты)
+### 4. Настройка конфигурации (секреты)
 
 Скопируйте пример .env:
 ```bash
@@ -77,7 +77,7 @@ ADMIN_CHAT_ID="123456789"
 #Имя вашего WireGuard интерфейса
 WG_INTERFACE="wg0"
 ```
-###5. Настройка конфигурации (пиры)
+### 5. Настройка конфигурации (пиры)
 
 Откройте файл main.py (например, nano main.py) и найдите секцию --- КОНФИГУРАЦИЯ ---.
 
@@ -86,7 +86,7 @@ WG_INTERFACE="wg0"
 - PEER_NAMES: Заполните этот словарь вашими IP-адресами и именами пиров.
 - PEER_QUOTAS: Заполните квоты трафика (в ГБ) для каждого пира.
 
-###6. Настройка sudo
+### 6. Настройка sudo
 
 Боту нужны права sudo для выполнения команд wg и systemctl, но без запроса пароля.
 Откройте файл sudoers для редактирования:
@@ -103,7 +103,7 @@ user ALL=(ALL) NOPASSWD: /bin/systemctl restart wg-quick@wg0.service
 
 Путь к systemctl может быть /usr/bin/systemctl — проверьте через which systemctl.
 
-###7. Запуск
+### 7. Запуск
 
 Можно запустить напрямую для теста:
 ```bash
@@ -112,11 +112,11 @@ python3 main.py
 
 ## ⚙️ Автозапуск через systemd (надо актуализировать путь в wg_bot.service)
 
-###Создайте файл сервиса:
+### Создайте файл сервиса:
 ```bash
 sudo nano /etc/systemd/system/wg_bot.service
 ```
-###Вставьте в него эту конфигурацию, заменив user и пути на ваши:
+### Вставьте в него эту конфигурацию, заменив user и пути на ваши:
 ```bash
 [Unit]
 Description=Tele-Monitor Bot
@@ -133,12 +133,12 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 ```
-###Включите и запустите сервис:
+### Включите и запустите сервис:
 ```bash
 sudo systemctl enable wg_bot.service
 sudo systemctl start wg_bot.service
 ```
-###Проверьте статус:
+### Проверьте статус:
 ```bash
 systemctl status wg_bot.service
 ```
