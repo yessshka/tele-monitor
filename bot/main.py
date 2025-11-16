@@ -7,315 +7,229 @@ import subprocess
 import time
 import sqlite3
 import os
+import asyncio  # НУЖНО ДЛЯ SPEEDTEST
+import json     # НУЖНО ДЛЯ .ENV
 from datetime import datetime, timedelta, time as dt_time
 from typing import Dict, Tuple, List, Optional
 
-# ИМПОРТЫ для .env и часовых поясов
-from dotenv import load_dotenv
 import pytz
-
 import psutil
+from dotenv import load_dotenv  # НУЖНО ДЛЯ .ENV
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import BadRequest  # НУЖНО ДЛЯ РЕДАКТИРОВАНИЯ СООБЩЕНИЙ
 
-# ИМПОРТЫ для ГРАФИКОВ
+# ГРАФИКИ
 try:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
-    print("WARNING: matplotlib not found. /chart command will be disabled.")
-    print("Run: pip install matplotlib")
+    print("WARNING: matplotlib not found. Charts disabled.")
 
-# --- КОНФИГУРАЦИЯ ---
+# --- КОНФИГУРАЦИЯ (Загружается из .env) ---
 
-# 1. Загружаем "секреты" из .env файла
+# Загружаем переменные окружения из .env файла
 load_dotenv()
+
+# Токен вашего бота от @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Ваш Telegram ID (для админских прав и личных отчетов)
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-WG_INTERFACE = os.getenv("WG_INTERFACE", "wg0") # По умолчанию 'wg0'
 
-if not BOT_TOKEN or not ADMIN_CHAT_ID:
-    print("="*50)
-    print("КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN или ADMIN_CHAT_ID не найдены.")
-    print("Пожалуйста, создайте файл .env и добавьте их.")
-    print("="*50)
-    exit(1)
+# ID вашего публичного канала (начинается с -100).
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 
-# 2. Настройки прочие
-DB_FILE = "vpn_telemetry.db"
-TZ_MOSCOW = pytz.timezone("Europe/Moscow")
-CPU_THRESHOLD = 80.0
-MEM_THRESHOLD = 80.0
-NET_THRESHOLD_MBPS = 500.0
-CHECK_INTERVAL_SECONDS = 60
+# Имя интерфейса WireGuard
+WG_INTERFACE = os.getenv("WG_INTERFACE", "wg0")
 
-# 3. Словарь пиров
-# Отредактируйте этот список, добавив своих реальных пиров
-PEER_NAMES = {
-    "10.66.66.2": "Client_PC",
-    "10.66.66.3": "Client_Phone_1",
-    "10.66.66.4": "Client_Phone_2",
-    "10.66.66.5": "User_PC_1",
-    "10.66.66.6": "User_Phone_1",
-    # ... и так далее
-}
+# Настройки БД и часового пояса
+DB_FILE = os.getenv("DB_FILE", "vpn_telemetry.db")
+TZ_MOSCOW = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
 
-# 4. Квоты трафика (в ГБ)
-# Отредактируйте квоты в соответствии с PEER_NAMES
-PEER_QUOTAS = {
-    "10.66.66.2": 250, 
-    "10.66.66.3": 100,
-    "10.66.66.4": 75,
-    "10.66.66.5": 100,
-    "10.66.66.6": 75,
-    # ... и так далее
-}
+# Пороги алертов
+CPU_THRESHOLD = float(os.getenv("CPU_THRESHOLD", 80.0))
+MEM_THRESHOLD = float(os.getenv("MEM_THRESHOLD", 80.0))
+NET_THRESHOLD_MBPS = float(os.getenv("NET_THRESHOLD_MBPS", 500.0))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 60))
 
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+# --- ВАШИ ПИРЫ (Загружаются как JSON из .env) ---
+try:
+    PEER_NAMES = json.loads(os.getenv("PEER_NAMES", "{}"))
+except json.JSONDecodeError:
+    print("WARNING: Не удалось прочитать PEER_NAMES из .env. Используется пустой словарь.")
+    PEER_NAMES = {}
+
+# --- КВОТЫ ПОЛЬЗОВАТЕЛЕЙ (в ГБ) (Загружаются как JSON из .env) ---
+try:
+    # os.getenv вернет строку, json.loads превратит ее в dict.
+    raw_quotas = json.loads(os.getenv("PEER_QUOTAS", "{}"))
+    # Конвертируем значения в числа (ГБ)
+    PEER_QUOTAS = {k: int(v) for k, v in raw_quotas.items()}
+except (json.JSONDecodeError, ValueError):
+    print("WARNING: Не удалось прочитать PEER_QUOTAS из .env. Используется пустой словарь.")
+    PEER_QUOTAS = {}
+
+# --- ПРОВЕРКА КРИТИЧЕСКИХ ПЕРЕМЕННЫХ ---
+if not BOT_TOKEN:
+    raise ValueError("Критическая ошибка: BOT_TOKEN не найден в .env файле.")
+if not ADMIN_CHAT_ID:
+    raise ValueError("Критическая ошибка: ADMIN_CHAT_ID не найден в .env файле.")
+if not PEER_NAMES:
+    print("WARNING: PEER_NAMES не определены. Функционал, связанный с пирами, будет ограничен.")
+
+
+# --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- ГЛОБАЛЬНОЕ СОСТОЯНИЕ (IN-MEMORY) ---
-alert_states = {
-    "cpu": False,
-    "mem": False,
-    "net": False,
-}
-
-# Отслеживание отправленных алертов о квотах
+# --- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ---
+alert_states = {"cpu": False, "mem": False, "net": False}
 quota_alert_sent = {}
+net_io_history = {"last_check": time.time(), "sent": 0, "recv": 0}
 
-net_io_history = {
-    "last_check_time": time.time(),
-    "last_bytes_sent": 0,
-    "last_bytes_recv": 0,
-}
-
-# --- СЛОЙ РАБОТЫ С БАЗОЙ ДАННЫХ ---
+# --- РАБОТА С БД ---
 
 def init_db():
-    """
-    Инициализирует структуру базы данных SQLite.
-    Создает таблицу для хранения исторических снэпшотов трафика.
-    """
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS traffic_snapshots (
+        cursor.execute('''CREATE TABLE IF NOT EXISTS traffic_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME NOT NULL,
                 peer_ip TEXT NOT NULL,
                 rx_bytes INTEGER NOT NULL,
-                tx_bytes INTEGER NOT NULL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_timestamp_ip 
-            ON traffic_snapshots (timestamp, peer_ip)
-        ''')
-        
+                tx_bytes INTEGER NOT NULL)''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_ts_ip ON traffic_snapshots (timestamp, peer_ip)')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
         conn.commit()
         conn.close()
-        logger.info(f"База данных {DB_FILE} успешно инициализирована.")
-    except Exception as e:
-        logger.error(f"Критическая ошибка инициализации БД: {e}")
+    except Exception as e: logger.error(f"DB Init Error: {e}")
 
-def save_traffic_snapshot(peers_data: Dict):
-    """
-    Сохраняет текущий срез данных по всем пирам в базу.
-    peers_data: Dict[IP, Dict[rx, tx, ...]]
-    """
-    if not peers_data:
-        return
-
+def get_setting(key: str) -> Optional[str]:
     try:
         conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        now_utc = datetime.now(pytz.utc)
-        
-        data_rows = []
-        for ip, data in peers_data.items():
-            data_rows.append((now_utc, ip, data["rx"], data["tx"]))
-        
-        cursor.executemany(
-            'INSERT INTO traffic_snapshots (timestamp, peer_ip, rx_bytes, tx_bytes) VALUES (?,?,?,?)',
-            data_rows
-        )
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+        res = cur.fetchone()
+        conn.close()
+        return res[0] if res else None
+    except: return None
+
+def set_setting(key: str, value: str):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
         conn.commit()
         conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка записи снэпшота в БД: {e}")
+    except Exception as e: logger.error(f"Set Setting Error: {e}")
+
+def save_traffic_snapshot(peers_data: Dict):
+    if not peers_data: return
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        now_utc = datetime.now(pytz.utc)
+        data = [(now_utc, ip, d["rx"], d["tx"]) for ip, d in peers_data.items()]
+        conn.executemany('INSERT INTO traffic_snapshots (timestamp, peer_ip, rx_bytes, tx_bytes) VALUES (?,?,?,?)', data)
+        conn.commit(); conn.close()
+    except Exception as e: logger.error(f"Snapshot Error: {e}")
 
 def calculate_traffic_delta(peer_ip: str, start_dt: datetime, end_dt: datetime) -> Tuple[int, int]:
-    """
-    Вычисляет потребленный трафик за период [start_dt, end_dt].
-    Реализует логику обработки сброса счетчиков (перезагрузки).
-    Возвращает кортеж (rx_delta, tx_delta).
-    """
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # 1. Находим запись, ближайшую к началу периода (но не позже start_dt)
-    cursor.execute('''
-        SELECT rx_bytes, tx_bytes FROM traffic_snapshots
-        WHERE peer_ip =? AND timestamp <=?
-        ORDER BY timestamp DESC LIMIT 1
-    ''', (peer_ip, start_dt))
-    start_row = cursor.fetchone()
-    
-    # 2. Находим запись, ближайшую к концу периода (обычно "сейчас")
-    cursor.execute('''
-        SELECT rx_bytes, tx_bytes FROM traffic_snapshots
-        WHERE peer_ip =? AND timestamp <=?
-        ORDER BY timestamp DESC LIMIT 1
-    ''', (peer_ip, end_dt))
-    end_row = cursor.fetchone()
-    
+    cur = conn.cursor()
+    start_s = start_dt.isoformat()
+    end_s = end_dt.isoformat()
+    cur.execute('SELECT rx_bytes, tx_bytes FROM traffic_snapshots WHERE peer_ip=? AND timestamp<=? ORDER BY timestamp DESC LIMIT 1', (peer_ip, start_dt))
+    start = cur.fetchone()
+    cur.execute('SELECT rx_bytes, tx_bytes FROM traffic_snapshots WHERE peer_ip=? AND timestamp<=? ORDER BY timestamp DESC LIMIT 1', (peer_ip, end_dt))
+    end = cur.fetchone()
     conn.close()
     
-    if not start_row or not end_row:
-        # Недостаточно данных для периода
-        return 0, 0
-        
-    start_rx, start_tx = start_row
-    end_rx, end_tx = end_row
-    
-    if end_rx < start_rx or end_tx < start_tx:
-        # Был сброс счетчика, считаем трафик с нуля
-        return end_rx, end_tx
-    
-    return (end_rx - start_rx), (end_tx - start_tx)
+    if not start or not end: return 0, 0
+    if end[0] < start[0] or end[1] < start[1]: return end # Reboot logic
+    return (end[0] - start[0]), (end[1] - start[1])
 
-# --- СИСТЕМНЫЕ МЕТРИКИ И WIREGUARD ---
+# --- СИСТЕМА И WG ---
 
 def get_system_metrics():
-    """Собирает метрики CPU, RAM и сети."""
-    cpu_usage = psutil.cpu_percent(interval=1)
-    mem_info = psutil.virtual_memory()
-    mem_usage = mem_info.percent
-
-    global net_io_history
-    current_time = time.time()
-    
-    if net_io_history["last_bytes_sent"] == 0:
-        net_counters = psutil.net_io_counters()
-        net_io_history["last_bytes_sent"] = net_counters.bytes_sent
-        net_io_history["last_bytes_recv"] = net_counters.bytes_recv
-        net_io_history["last_check_time"] = current_time
-        net_upload_mbps, net_download_mbps = 0.0, 0.0
-    else:
-        time_delta = current_time - net_io_history["last_check_time"]
-        current_net_counters = psutil.net_io_counters()
-        
-        bytes_sent_delta = current_net_counters.bytes_sent - net_io_history["last_bytes_sent"]
-        bytes_recv_delta = current_net_counters.bytes_recv - net_io_history["last_bytes_recv"]
-
-        if time_delta > 0 and bytes_sent_delta >= 0:
-            net_upload_mbps = (bytes_sent_delta * 8) / (time_delta * 1_000_000)
-            net_download_mbps = (bytes_recv_delta * 8) / (time_delta * 1_000_000)
-        else:
-            net_upload_mbps, net_download_mbps = 0.0, 0.0
-
-        net_io_history["last_check_time"] = current_time
-        net_io_history["last_bytes_sent"] = current_net_counters.bytes_sent
-        net_io_history["last_bytes_recv"] = current_net_counters.bytes_recv
-
-    return {
-        "cpu": cpu_usage,
-        "mem": mem_usage,
-        "upload_mbps": net_upload_mbps,
-        "download_mbps": net_download_mbps,
-        "total_mbps": net_upload_mbps + net_download_mbps,
-    }
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory().percent
+    now = time.time()
+    net = psutil.net_io_counters()
+    delta_t = now - net_io_history["last_check"]
+    if delta_t <= 0: delta_t = 1
+    up_mbps = ((net.bytes_sent - net_io_history["sent"]) * 8) / (delta_t * 1e6)
+    down_mbps = ((net.bytes_recv - net_io_history["recv"]) * 8) / (delta_t * 1e6)
+    net_io_history.update({"last_check": now, "sent": net.bytes_sent, "recv": net.bytes_recv})
+    return {"cpu": cpu, "mem": mem, "up": max(0, up_mbps), "down": max(0, down_mbps)}
 
 def get_wg_peer_stats() -> Dict:
-    """
-    ОБНОВЛЕНО: Парсит 'wg show all dump'
-    Возвращает словарь: { 'ip': {'rx':.., 'tx':.., 'handshake':.., 'pubkey':..} }
-    """
     try:
-        result = subprocess.run(
-            ["sudo", "wg", "show", "all", "dump"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10
-        )
-        
+        res = subprocess.run(["sudo", "wg", "show", "all", "dump"], capture_output=True, text=True, timeout=5)
         stats = {}
-        # Индексы:       0      1         2      3          4            5           6   7      8
-        #           iface  pubkey    psk   endpoint   allowed_ips  handshake   rx  tx  keepalive
-        for line in result.stdout.strip().splitlines():
+        for line in res.stdout.strip().splitlines():
             parts = line.split('\t')
-            # Убедимся, что строка содержит все нужные части
             if len(parts) >= 8:
-                pubkey = parts[1]
-                allowed_ips = parts[4]
-                handshake = int(parts[5])
-                rx_bytes = int(parts[6])
-                tx_bytes = int(parts[7])
-                
-                ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', allowed_ips)
-                if ip_match:
-                    ip_addr = ip_match.group(1)
-                    if ip_addr in PEER_NAMES:
-                        stats[ip_addr] = {
-                            "rx": rx_bytes,
-                            "tx": tx_bytes,
-                            "handshake": handshake,
-                            "pubkey": pubkey
-                        }
+                ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', parts[4])
+                if ip_match and ip_match.group(1) in PEER_NAMES:
+                    stats[ip_match.group(1)] = {
+                        "rx": int(parts[6]), "tx": int(parts[7]),
+                        "handshake": int(parts[5]), "pubkey": parts[1]
+                    }
         return stats
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Ошибка выполнения wg show: {e.stderr}")
-        return {}
-    except Exception as e:
-        logger.error(f"Непредвиденная ошибка парсинга WG: {e}")
-        return {}
+    except: return {}
 
 def format_bytes(size: float) -> str:
-    """Преобразует байты в человекочитаемый формат (MB, GB)."""
-    power = 1024
-    n = 0
-    power_labels = {0 : 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+    power, n = 1024, 0
+    labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
     while size > power and n < 4:
-        size /= power
-        n += 1
-    return f"{size:.2f} {power_labels[n]}"
+        size /= power; n += 1
+    return f"{size:.2f} {labels[n]}"
 
-# --- НОВАЯ УТИЛИТА: ПРОВЕРКА АДМИНА ---
+def format_bytes_ru_caps(size: float) -> str:
+    """Специальный формат для итогов месяца: ТЕРАБАЙТА, ГИГАБАЙТА"""
+    power, n = 1024, 0
+    # Склонения упрощены для "Всего прокачано ..."
+    labels = {0: 'БАЙТ', 1: 'КИЛОБАЙТА', 2: 'МЕГАБАЙТА', 3: 'ГИГАБАЙТА', 4: 'ТЕРАБАЙТА'}
+    while size > power and n < 4:
+        size /= power; n += 1
+    return f"{size:.1f} {labels[n]}"
+
+def get_ru_month(date_obj, case='nominative'):
+    """Возвращает название месяца на русском."""
+    months_nom = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", 
+                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+    months_gen = ["января", "февраля", "марта", "апреля", "мая", "июня", 
+                  "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    idx = date_obj.month - 1
+    return months_gen[idx] if case == 'genitive' else months_nom[idx]
+
 def is_admin(update: Update) -> bool:
-    """Проверяет, является ли пользователь админом (из ADMIN_CHAT_ID)."""
-    if not update.effective_user:
-        return False
-    # Сравниваем ID как строки для надежности
-    return str(update.effective_user.id) == str(ADMIN_CHAT_ID)
+    return str(update.effective_user.id) == str(ADMIN_CHAT_ID) if update.effective_user else False
 
-
-# --- ОБРАБОТЧИКИ TELEGRAM ---
+# --- КОМАНДЫ ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветственное сообщение."""
     await update.message.reply_html(
-        "<b>🤖 VPN Monitor Bot v2.1</b>\n\n"
+        "<b>🤖 VPN Monitor Bot v3.0</b>\n\n"
         "Система мониторинга и учета трафика активна.\n"
         "<b>Доступные команды:</b>\n"
         "/monitoring - Текущая нагрузка сервера\n"
-        "/active_wg - Список пиров (полный)\n"
         "/online - Кто сейчас в сети\n"
-        "/chart <code>&lt;имя&gt;</code> - График трат за 7 дней\n\n"
+        "/active_wg - Список пиров (полный)\n"
+        "/chart <code>&lt;имя&gt;</code> - График потребления за 7 дней\n\n"
         "<b>Админ-команды:</b>\n"
-        "/test_quota - (Тест) Запуск отчета по квотам\n"
+        "/broadcast - Опубликовать анонс техработ\n"
         "/block <code>&lt;имя&gt;</code> - Заблокировать пира\n"
         "/unblock - Разблокировать всех (перезапуск WG)\n"
+        "/force_dash - Принудительно обновить табло\n"
+        "/test_quota - (Тест) Запуск отчета по квотам\n"
+        "/test_speed - (Тест) Запуск проверки скорости\n"
     )
 
 async def monitoring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,8 +241,8 @@ async def monitoring_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"<b>📊 Состояние сервера</b>\n"
         f"🖥 CPU: <code>{m['cpu']}%</code>\n"
         f"🧠 RAM: <code>{m['mem']}%</code>\n"
-        f"📡 Net Up: <code>{m['upload_mbps']:.1f} Mbps</code>\n"
-        f"📡 Net Down: <code>{m['download_mbps']:.1f} Mbps</code>\n"
+        f"📡 Net Up: <code>{m['up']:.1f} Mbps</code>\n"
+        f"📡 Net Down: <code>{m['down']:.1f} Mbps</code>\n"
         f"⏱ Uptime: {uptime}"
     )
     await update.message.reply_html(msg)
@@ -358,456 +272,398 @@ async def active_wg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
-#
-# --- ТЕСТОВАЯ КОМАНДА ---
-#
-async def test_quota_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    ВРЕМЕННАЯ КОМАНДА: Ручной запуск ежедневного отчета
-    для проверки логики квот.
-    """
-    if not is_admin(update):
-        await update.message.reply_text("⛔️ Эта команда только для админа.")
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    if not CHANNEL_ID: 
+        await update.message.reply_text("❌ ID канала не настроен.")
         return
-
-    if not update.effective_user:
-        return
-        
-    logger.info(f"Ручной запуск daily_report_job по команде от {update.effective_user.id}")
-    await update.message.reply_text("⏳ Запускаю ежедневный отчет для проверки квот... "
-                                    "Результат (и алерты) будут отправлены в главный чат.")
-    try:
-        await daily_report_job(context)
-        await update.message.reply_text("✅ Проверка завершена.")
-    except Exception as e:
-        logger.error(f"Ошибка при ручном запуске daily_report_job: {e}")
-        await update.message.reply_text(f"Ошибка при проверке: {e}")
-
-#
-# --- ТАБЛО (/online) ---
-#
-async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает, кто из пиров сейчас онлайн (handshake < 3 мин)."""
-    stats = get_wg_peer_stats()
-    if not stats:
-        await update.message.reply_html("Не удалось получить статистику WG.")
-        return
-
-    now = time.time()
-    online_peers = []
-    # 3 минуты = 180 секунд
-    HANDSHAKE_THRESHOLD = 180 
-
-    for ip, data in stats.items():
-        time_since_handshake = now - data["handshake"]
-        if time_since_handshake < HANDSHAKE_THRESHOLD:
-            name = PEER_NAMES.get(ip, ip)
-            online_peers.append(name)
-    
-    if not online_peers:
-        await update.message.reply_html("<b>🟢 В сети (0):</b>\nНет активных пиров.")
-        return
-
-    message = f"<b>🟢 В сети ({len(online_peers)}):</b>\n"
-    message += "\n".join([f"• {name}" for name in sorted(online_peers)])
-    await update.message.reply_html(message)
-
-#
-# --- АНАЛИТИК (/chart) ---
-#
-async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Рисует график потребления трафика за 7 дней для пира."""
-    if not MATPLOTLIB_AVAILABLE:
-        await update.message.reply_text("Ошибка: Модуль matplotlib не установлен на сервере.")
-        return
-    
     if not context.args:
-        await update.message.reply_text("Использование: /chart <имя_пира>")
+        await update.message.reply_text("Текст?")
         return
+    try:
+        # Заголовок "ОБЪЯВЛЕНИЕ"
+        user_text = " ".join(context.args)
+        message_text = f"📢 <b>ОБЪЯВЛЕНИЕ</b>\n{user_text}"
         
-    peer_name_req = context.args[0].lower()
-    peer_ip = None
-    peer_name = ""
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=message_text, parse_mode=ParseMode.HTML)
+        await update.message.reply_text("✅ Опубликовано.")
+    except Exception as e: await update.message.reply_text(f"Ошибка: {e}")
 
-    # Ищем IP по имени
-    for ip, name in PEER_NAMES.items():
-        if name.lower() == peer_name_req:
-            peer_ip = ip
-            peer_name = name
-            break
-            
-    if not peer_ip:
-        await update.message.reply_text(f"Пир с именем '{peer_name_req}' не найден.")
+async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not MATPLOTLIB_AVAILABLE:
+        await update.message.reply_text("Ошибка: модуль matplotlib не установлен.")
         return
 
-    await update.message.reply_text(f"⏳ Собираю данные для графика '{peer_name}'...")
+    target_ip = None
+    chart_title = ""
+    
+    # 1. Если аргумент есть - ищем конкретного пира
+    if context.args:
+        name_req = context.args[0].lower()
+        target_ip = next((ip for ip, n in PEER_NAMES.items() if n.lower() == name_req), None)
+        if not target_ip:
+            await update.message.reply_text("Пир не найден.")
+            return
+        chart_title = f"Трафик: {PEER_NAMES[target_ip]}"
+    
+    # 2. Если аргумента нет - будем строить общий (target_ip останется None)
+    else:
+        chart_title = "Общий трафик (Все пиры)"
+
+    await update.message.reply_text("⏳ Рисую график...")
 
     try:
         labels = []
-        values_gb = []
+        values = []
         now_utc = datetime.now(pytz.utc)
 
-        # Собираем данные за 7 дней (включая сегодня)
+        # Собираем данные за 7 дней
         for i in range(6, -1, -1):
-            target_day_start = (now_utc - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
-            target_day_end = target_day_start.replace(hour=23, minute=59, second=59)
+            start = (now_utc - timedelta(days=i)).replace(hour=0, minute=0, second=0)
+            end = start.replace(hour=23, minute=59, second=59)
             
-            rx, tx = calculate_traffic_delta(peer_ip, target_day_start, target_day_end)
-            total_gb = (rx + tx) / (1024**3) # Конвертируем в ГБ
+            total_gb = 0
             
-            labels.append(target_day_start.strftime("%d.%m"))
-            values_gb.append(total_gb)
+            if target_ip:
+                # Данные для одного пира
+                rx, tx = calculate_traffic_delta(target_ip, start, end)
+                total_gb = (rx + tx) / (1024**3)
+            else:
+                # Данные для ВСЕХ пиров (суммируем)
+                day_sum_bytes = 0
+                for ip in PEER_NAMES:
+                    rx, tx = calculate_traffic_delta(ip, start, end)
+                    day_sum_bytes += (rx + tx)
+                total_gb = day_sum_bytes / (1024**3)
+            
+            labels.append(start.strftime("%d.%m"))
+            values.append(total_gb)
 
-        # Рисуем график
+        # Рисуем
         plt.figure(figsize=(10, 6))
-        plt.bar(labels, values_gb, color="#4c8cf5")
-        plt.title(f"Трафик для '{peer_name}' (Последние 7 дней)")
+        plt.bar(labels, values, color="#4c8cf5")
+        plt.title(chart_title)
         plt.ylabel("Трафик (ГБ)")
-        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.grid(axis='y', alpha=0.7)
         
-        # Сохраняем в файл
-        chart_file = f"/tmp/wg_chart_{peer_ip}.png"
-        plt.savefig(chart_file)
-        plt.close() # Важно закрыть, чтобы не утекала память
-
-        # Отправляем фото
-        with open(chart_file, 'rb') as photo:
-            await update.message.reply_photo(photo)
-            
-        os.remove(chart_file) # Удаляем временный файл
+        f = f"/tmp/chart_temp.png"
+        plt.savefig(f)
+        plt.close()
+        
+        with open(f, 'rb') as p: 
+            await update.message.reply_photo(p)
+        os.remove(f)
 
     except Exception as e:
-        logger.error(f"Ошибка создания графика: {e}")
-        await update.message.reply_text(f"Не удалось создать график: {e}")
+        logger.error(f"Chart Error: {e}")
+        await update.message.reply_text(f"Ошибка при создании графика: {e}")
 
+# --- ЗАДАЧИ (JOBS) ---
 
-#
-# --- ПРИВРАТНИК (/block, /unblock) ---
-#
-async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Админ) Блокирует пира, удаляя его из live-конфига WG."""
-    if not is_admin(update):
-        await update.message.reply_text("⛔️ Эта команда только для админа.")
-        return
+async def live_dashboard_job(context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет табло в канале (на русском)."""
+    if not CHANNEL_ID or CHANNEL_ID == "": return
+    sys = get_system_metrics()
+    wg = get_wg_peer_stats()
+    now_ts = time.time()
+    active_count = sum(1 for d in wg.values() if now_ts - d['handshake'] < 180)
+    uptime = str(timedelta(seconds=int(time.time() - psutil.boot_time())))
+    
+    text = (
+        f"🟢 <b>СТАТУС СИСТЕМЫ: ОНЛАЙН</b>\n\n"
+        f"⏱ <b>Аптайм:</b> {uptime}\n"
+        f"👥 <b>Активных пользователей:</b> {active_count} / {len(PEER_NAMES)}\n"
+        f"📉 <b>Загрузка:</b> CPU {sys['cpu']}% | RAM {sys['mem']}%\n"
+        f"⚡️ <b>Сеть:</b> ▲ {sys['up']:.1f} Мбит/с | ▼ {sys['down']:.1f} Мбит/с\n\n"
+        f"<i>Обновлено: {datetime.now(TZ_MOSCOW).strftime('%H:%M:%S')} МСК</i>"
+    )
 
-    if not context.args:
-        await update.message.reply_text("Использование: /block <имя_пира>")
-        return
-        
-    peer_name_req = context.args[0].lower()
-    peer_ip = None
-    peer_name = ""
-
-    for ip, name in PEER_NAMES.items():
-        if name.lower() == peer_name_req:
-            peer_ip = ip
-            peer_name = name
-            break
-            
-    if not peer_ip:
-        await update.message.reply_text(f"Пир с именем '{peer_name_req}' не найден.")
-        return
-
+    msg_id = get_setting("dashboard_msg_id")
     try:
-        stats = get_wg_peer_stats()
-        if peer_ip not in stats:
-            await update.message.reply_text(f"Не удалось найти PublicKey для '{peer_name}'.")
-            return
-            
-        pubkey = stats[peer_ip]["pubkey"]
+        if msg_id:
+            try:
+                await context.bot.edit_message_text(chat_id=CHANNEL_ID, message_id=int(msg_id), text=text, parse_mode=ParseMode.HTML)
+            except BadRequest: pass
+        else: raise Exception
+    except:
+        try:
+            msg = await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
+            await context.bot.pin_chat_message(chat_id=CHANNEL_ID, message_id=msg.message_id)
+            set_setting("dashboard_msg_id", str(msg.message_id))
+        except: pass
+
+async def weekly_speedtest_job(context: ContextTypes.DEFAULT_TYPE):
+    if not CHANNEL_ID or CHANNEL_ID == "": 
+        return
         
-        # Блокируем пира (удаляем из сессии)
-        subprocess.run(
-            ["sudo", "wg", "set", WG_INTERFACE, "peer", pubkey, "remove"],
-            check=True, capture_output=True
+    try:
+        cmd = ["speedtest-cli", "--simple"]
+    
+        res = await asyncio.to_thread(
+            subprocess.run, 
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=300 # 5 минут
         )
-        
-        logger.info(f"ADMIN: Пир '{peer_name}' заблокирован по команде.")
-        await update.message.reply_html(f"🔴 Пир <b>{peer_name}</b> был отключен (заблокирован).")
+    
+        #
+        if res.returncode == 0:
+            output = res.stdout.replace("Ping:", "📶 <b>Ping:</b>").replace("Download:", "⬇️ <b>Download:</b>").replace("Upload:", "⬆️ <b>Upload:</b>")
+            msg = f"🚀 <b>Еженедельный тест скорости</b>\n\n{output}\n<i>Сервер работает стабильно!</i>"
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.HTML)
+        else:
+            # Этот код будет выполняться, если speedtest-cli завершится с ошибкой
+            logger.error(f"Speedtest-CLI FAILED (Code: {res.returncode}): {res.stderr}")
+            # (Опционально) Сообщаем админу
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ Тест скорости провалился:\n<code>{res.stderr}</code>", parse_mode=ParseMode.HTML)
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Ошибка блокировки пира: {e.stderr.decode()}")
-        await update.message.reply_text(f"Ошибка выполнения wg: {e.stderr.decode()}")
-    except Exception as e:
-        logger.error(f"Ошибка в /block: {e}")
-        await update.message.reply_text(f"Ошибка: {e}")
+    except asyncio.TimeoutError:
+         # Эта ошибка возникнет, если сработает timeout=300
+        logger.error("Speedtest-CLI Error: Process timed out.")
+    except Exception as e: 
+        # Эта ошибка сработает, если 'speedtest-cli' не найден (FileNotFoundError)
+        logger.error(f"Speedtest Error (likely not installed?): {e}")
+        # (Опционально) Сообщаем админу
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ Тест скорости не запущен:\n<code>{e}</code>", parse_mode=ParseMode.HTML)
 
-async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Админ) Перезапускает сервис WG, восстанавливая всех пиров из конфига."""
+async def test_speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(АДМИН) Ручной запуск теста скорости"""
     if not is_admin(update):
-        await update.message.reply_text("⛔️ Эта команда только для админа.")
         return
 
-    try:
-        await update.message.reply_text(f"⏳ Перезапускаю интерфейс `wg-quick@{WG_INTERFACE}`..."
-                                        "\n(Это восстановит всех пиров из конфига)")
-        
-        # "Кувалда" - перезапускаем сервис, чтобы он перечитал конфиг
-        subprocess.run(
-            ["sudo", "systemctl", "restart", f"wg-quick@{WG_INTERFACE}.service"],
-            check=True, capture_output=True
-        )
-        
-        logger.info(f"ADMIN: Интерфейс WG перезапущен по команде /unblock.")
-        await update.message.reply_html("✅ <b>Готово!</b>\nВсе пиры восстановлены из файла конфигурации.")
+    await update.message.reply_text("⏳ Запускаю тест скорости... Это может занять несколько минут.")
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Ошибка перезапуска WG: {e.stderr.decode()}")
-        await update.message.reply_text(f"Ошибка выполнения systemctl: {e.stderr.decode()}")
-    except Exception as e:
-        logger.error(f"Ошибка в /unblock: {e}")
-        await update.message.reply_text(f"Ошибка: {e}")
+    # Вызываем нужную нам задачу
+    await weekly_speedtest_job(context)
 
+    await update.message.reply_text("✅ Тест завершен. Проверьте канал или логи.")
 
-# --- ФОНОВЫЕ ЗАДАЧИ (JOBS) ---
-
-async def traffic_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
+async def monthly_public_report_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Задача, выполняемая каждые 10 минут.
-    Снимает показания счетчиков и сохраняет в БД.
+    Публикует статистику за ПРОШЛЫЙ месяц.
+    Находит самый активный день и форматирует трафик.
     """
-    stats = get_wg_peer_stats()
-    if stats:
-        save_traffic_snapshot(stats)
-        # logger.info("Снэпшот трафика сохранен.")
-
-async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Генерация и отправка ежедневного отчета в 21:00 МСК.
-    Включает: топ пользователей за день, общий трафик за месяц.
-    """
-    logger.info("Формирование ежедневного отчета...")
+    if not CHANNEL_ID or CHANNEL_ID == "": return
     
-    now_msk = datetime.now(TZ_MOSCOW)
-    start_of_day_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_of_day_utc = start_of_day_msk.astimezone(pytz.utc)
-    start_of_month_msk = now_msk.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    start_of_month_utc = start_of_month_msk.astimezone(pytz.utc)
-    now_utc = datetime.now(pytz.utc)
+    # 1. Определяем границы прошлого месяца
+    now = datetime.now(pytz.utc)
+    # Первый день текущего месяца
+    first_day_curr = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # Последний день прошлого месяца
+    last_day_prev = first_day_curr - timedelta(seconds=1)
+    # Первый день прошлого месяца
+    first_day_prev = last_day_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
-    current_stats = get_wg_peer_stats()
-    # Убедимся, что current_stats не пустой, прежде чем сохранять
-    if current_stats:
-        save_traffic_snapshot(current_stats)
+    # Имя прошлого месяца для заголовка
+    month_name = get_ru_month(first_day_prev, 'genitive')
     
-    user_metrics = []
-    total_month_traffic = 0
+    # 2. Считаем статистику
+    total_traffic = 0
+    busiest_day_date = None
+    max_day_traffic = 0
     
-    for ip, name in PEER_NAMES.items():
-        rx_day, tx_day = calculate_traffic_delta(ip, start_of_day_utc, now_utc)
-        day_sum = rx_day + tx_day
+    # Проходим по всем дням прошлого месяца
+    curr_day = first_day_prev
+    while curr_day <= last_day_prev:
+        next_day = curr_day + timedelta(days=1)
+        day_end = next_day - timedelta(seconds=1)
         
-        rx_month, tx_month = calculate_traffic_delta(ip, start_of_month_utc, now_utc)
-        month_sum = rx_month + tx_month
+        day_traffic_sum = 0
+        # Суммируем трафик всех пиров за этот день
+        for ip in PEER_NAMES:
+            rx, tx = calculate_traffic_delta(ip, curr_day, day_end)
+            day_traffic_sum += (rx + tx)
         
-        total_month_traffic += month_sum
+        total_traffic += day_traffic_sum
         
-        #
-        # --- ЛОГИКА ПРОВЕРКИ КВОТ ---
-        #
-        global quota_alert_sent
-        quota_gb = PEER_QUOTAS.get(ip)
-        
-        if quota_gb: # Если квота для этого IP установлена
-            month_gb = month_sum / (1024**3) # Переводим трафик в ГБ
+        if day_traffic_sum > max_day_traffic:
+            max_day_traffic = day_traffic_sum
+            busiest_day_date = curr_day
             
-            # Проверяем, превышена ли квота и не отправляли ли мы уже алерт
-            if month_gb > quota_gb and not quota_alert_sent.get(ip):
-                alert_text = (
-                    f"❗️<b>Превышение месячной квоты!</b>\n\n"
-                    f"Пир <b>{name}</b> ({ip}) использовал <b>{month_gb:.2f} ГБ</b>.\n"
-                    f"Установленный лимит: <b>{quota_gb} ГБ</b>."
-                )
-                # Отправляем алерт (независимо от отчета)
-                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=alert_text, parse_mode=ParseMode.HTML)
-                quota_alert_sent[ip] = True # Помечаем, что алерт отправлен
-        #
-        # --- КОНЕЦ ЛОГИКИ КВОТ ---
-        #
-        
-        if day_sum > 0 or month_sum > 0:
-            user_metrics.append({
-                "name": name,
-                "day": day_sum,
-                "month": month_sum
-            })
-    
-    user_metrics.sort(key=lambda x: x["day"], reverse=True)
-    
-    lines = []
-    lines.append(f"<b>📊 Ежедневный отчет {now_msk.strftime('%d.%m.%Y')}</b>\n")
-    lines.append(f"<i>Общий трафик за месяц: {format_bytes(total_month_traffic)}</i>\n")
-    lines.append("<b>Топ пользователей за день:</b>")
-    
-    if not user_metrics:
-        lines.append("Нет активности.")
-    
-    for idx, u in enumerate(user_metrics, 1):
-        icon = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else "👤"
-        lines.append(
-            f"{icon} <b>{u['name']}</b>: {format_bytes(u['day'])} "
-            f"(Мес: {format_bytes(u['month'])})"
-        )
-    
-    report_text = "\n".join(lines)
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report_text, parse_mode=ParseMode.HTML)
+        curr_day = next_day
+
+    # 3. Форматируем самый активный день
+    if busiest_day_date:
+        busiest_day_str = f"{busiest_day_date.day} {get_ru_month(busiest_day_date, 'genitive')}"
+    else:
+        busiest_day_str = "Нет данных"
+
+    # 4. Отправляем сообщение
+    msg = (
+        f"📊 <b>Итоги {month_name.title()}</b>\n"
+        f"🌐 Всего прокачано трафика: <b>{format_bytes_ru_caps(total_traffic)}</b> 🤯\n"
+        f"👥 Самый активный день: <b>{busiest_day_str}</b>\n\n"
+        "Спасибо, что остаетесь с нами!"
+    )
+    await context.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode=ParseMode.HTML)
 
 async def payment_reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Напоминание об оплате (проверка в 12:00, сработка 5-го числа).
-    Также сбрасывает флаги алертов о квотах 1-го числа.
-    """
     now_msk = datetime.now(TZ_MOSCOW)
     
-    #
-    # --- ЛОГИКА СБРОСА КВОТ ---
-    #
-    # 1-го числа каждого месяца сбрасываем флаги алертов
+    # Сброс квот 1-го числа
     if now_msk.day == 1:
-        global quota_alert_sent
-        if quota_alert_sent: # Если словарь не пуст
-            logger.info("Новый месяц! Сброс флагов оповещений о квотах.")
-            quota_alert_sent = {}
-    #
-    # --- КОНЕЦ ЛОГИКИ СБРОСА ---
-    #
-
+        global quota_alert_sent; quota_alert_sent = {}
+    
     if now_msk.day == 5:
-        msg = (
+        # 1. АДМИНУ
+        admin_msg = (
             "💰 <b>Финансовое уведомление</b>\n\n"
             "Сегодня 5-е число. Напоминание:\n"
             "1. Оплатить VPS-хостинг.\n"
             "2. Проверить поступление взносов от пользователей."
         )
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=msg, parse_mode=ParseMode.HTML)
+        try: await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_msg, parse_mode=ParseMode.HTML)
+        except: pass
+
+        # 2. В КАНАЛ
+        if CHANNEL_ID and CHANNEL_ID != "":
+            public_msg = (
+                "🔔 <b>Ежемесячное напоминание</b>\n\n"
+                "На календаре 5-е число — время продлить доступ к сервису, "
+                "имя которого сейчас лучше не называть 🤫\n\n"
+                "💳 <b>Реквизиты:</b> прежние.\n\n"
+                "<i>Спасибо, что остаетесь с нами!</i>"
+            )
+            try: await context.bot.send_message(chat_id=CHANNEL_ID, text=public_msg, parse_mode=ParseMode.HTML)
+            except: pass
+
+async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневный отчет АДМИНУ."""
+    now_msk = datetime.now(TZ_MOSCOW)
+    start_day_utc = now_msk.replace(hour=0, minute=0, second=0).astimezone(pytz.utc)
+    start_month_utc = now_msk.replace(day=1, hour=0, minute=0, second=0).astimezone(pytz.utc)
+    now_utc = datetime.now(pytz.utc)
+    
+    current_stats = get_wg_peer_stats()
+    if current_stats: save_traffic_snapshot(current_stats)
+    
+    user_metrics = []
+    total_month = 0
+    global quota_alert_sent
+    
+    for ip, name in PEER_NAMES.items():
+        rx_d, tx_d = calculate_traffic_delta(ip, start_day_utc, now_utc)
+        day_sum = rx_d + tx_d
+        rx_m, tx_m = calculate_traffic_delta(ip, start_month_utc, now_utc)
+        month_sum = rx_m + tx_m
+        total_month += month_sum
+        
+        quota = PEER_QUOTAS.get(ip)
+        if quota:
+            m_gb = month_sum / (1024**3)
+            if m_gb > quota and not quota_alert_sent.get(ip):
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"❗️<b>Лимит!</b>\n{name}: {m_gb:.1f}/{quota}GB", parse_mode=ParseMode.HTML)
+                quota_alert_sent[ip] = True
+        
+        if day_sum > 0 or month_sum > 0:
+            user_metrics.append({"name": name, "day": day_sum, "month": month_sum})
+            
+    user_metrics.sort(key=lambda x: x["day"], reverse=True)
+    
+    # ФОРМАТИРОВАНИЕ ЕЖЕДНЕВНОГО ОТЧЕТА
+    report = f"📊 <b>Ежедневный отчет {now_msk.strftime('%d.%m.%Y')}</b>\n\n"
+    report += f"Общий трафик за месяц: <b>{format_bytes(total_month)}</b>\n\n"
+    report += "Топ пользователей за день:\n"
+    
+    if not user_metrics:
+        report += "Нет активности."
+    
+    for i, u in enumerate(user_metrics, 1):
+        if i == 1: icon = "🥇"
+        elif i == 2: icon = "🥈"
+        elif i == 3: icon = "🥉"
+        else: icon = "👤"
+        
+        report += f"{icon} {u['name']}: {format_bytes(u['day'])} (Мес: {format_bytes(u['month'])})\n"
+        
+    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report, parse_mode=ParseMode.HTML)
+
+async def traffic_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
+    stats = get_wg_peer_stats()
+    if stats: save_traffic_snapshot(stats)
 
 async def system_alert_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Периодическая проверка ресурсов (каждую минуту).
-    Отправляет алерты при превышении порогов.
-    """
-    global alert_states
-    m = get_system_metrics()
-    
-    alerts = []
-    
-    if m["cpu"] > CPU_THRESHOLD and not alert_states["cpu"]:
-        alerts.append(f"🚨 High CPU Usage: {m['cpu']}%")
-        alert_states["cpu"] = True
-    elif m["cpu"] < CPU_THRESHOLD and alert_states["cpu"]:
-        alert_states["cpu"] = False
-        
-    if m["mem"] > MEM_THRESHOLD and not alert_states["mem"]:
-        alerts.append(f"🚨 Low Memory: {m['mem']}% used")
-        alert_states["mem"] = True
-    elif m["mem"] < MEM_THRESHOLD and alert_states["mem"]:
-        alert_states["mem"] = False
+    global alert_states; m = get_system_metrics(); alerts = []
+    if m["cpu"] > CPU_THRESHOLD and not alert_states["cpu"]: alerts.append(f"🚨 CPU: {m['cpu']}%"); alert_states["cpu"] = True
+    elif m["cpu"] < CPU_THRESHOLD: alert_states["cpu"] = False
+    if m["mem"] > MEM_THRESHOLD and not alert_states["mem"]: alerts.append(f"🚨 RAM: {m['mem']}%"); alert_states["mem"] = True
+    elif m["mem"] < MEM_THRESHOLD: alert_states["mem"] = False
+    if alerts: await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="\n".join(alerts))
 
-    if alerts:
-        text = "\n".join(alerts)
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
-
-#
-# --- ЗАДАЧА ОЧИСТКИ ---
-#
 async def cleanup_old_data_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Удаляет старые снэпшоты (старше 90 дней) и сжимает БД.
-    Запускается ежедневно в 04:00 МСК.
-    """
-    # Устанавливаем порог: 90 дней назад
-    cutoff_date = datetime.now(pytz.utc) - timedelta(days=90)
-    conn = None
-    
+    cutoff = datetime.now(pytz.utc) - timedelta(days=90)
     try:
         conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        logger.info(f"Запуск очистки БД: удаление записей старше {cutoff_date.date()}...")
-        
-        # 1. Удаляем старые данные
-        cursor.execute(
-            "DELETE FROM traffic_snapshots WHERE timestamp < ?", 
-            (cutoff_date,)
-        )
-        conn.commit()
-        
-        # Узнаем, сколько строк было удалено
-        deleted_count = cursor.rowcount
-        
-        if deleted_count > 0:
-            logger.info(f"Удалено {deleted_count} старых записей.")
-            
-            # 2. Сжимаем файл БД, чтобы вернуть место системе
-            # VACUUM перестраивает БД и освобождает место
-            logger.info("Выполняю VACUUM для сжатия файла БД...")
-            conn.execute("VACUUM")
-            logger.info("Сжатие БД завершено.")
-        else:
-            logger.info("Старых записей для удаления не найдено.")
-            
-    except Exception as e:
-        logger.error(f"Ошибка во время очистки БД: {e}")
-    finally:
-        if conn:
-            conn.close()
+        conn.execute("DELETE FROM traffic_snapshots WHERE timestamp < ?", (cutoff.isoformat(),))
+        conn.commit(); conn.execute("VACUUM"); conn.close()
+    except: pass
 
-# --- ТОЧКА ВХОДА ---
+# --- УПРАВЛЕНИЕ ТАБЛО И ПИРАМИ ---
+async def force_dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    await live_dashboard_job(context)
+    await update.message.reply_text("✅ Табло обновлено.")
+
+async def online_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = get_wg_peer_stats()
+    now = time.time()
+    online = [PEER_NAMES.get(ip, ip) for ip, d in stats.items() if now - d['handshake'] < 180]
+    if not online: await update.message.reply_html("Нет активных пиров.")
+    else: await update.message.reply_html(f"<b>🟢 В сети ({len(online)}):</b>\n" + "\n".join([f"• {n}" for n in sorted(online)]))
+
+async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update) or not context.args: return
+    peer_req = context.args[0].lower()
+    ip_target = next((ip for ip, n in PEER_NAMES.items() if n.lower() == peer_req), None)
+    if not ip_target: return
+    
+    stats = get_wg_peer_stats()
+    if ip_target in stats:
+        subprocess.run(["sudo", "wg", "set", WG_INTERFACE, "peer", stats[ip_target]["pubkey"], "remove"])
+        await update.message.reply_text(f"🔴 {PEER_NAMES[ip_target]} заблокирован.")
+
+async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    subprocess.run(["sudo", "systemctl", "restart", f"wg-quick@{WG_INTERFACE}.service"])
+    await update.message.reply_text("✅ Все разблокированы.")
+
+async def test_quota_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update): await daily_report_job(context)
+
+# --- MAIN ---
 
 def main():
-    # 0. Проверка matplotlib
-    if not MATPLOTLIB_AVAILABLE:
-        logger.warning("Matplotlib не найден. Команда /chart будет недоступна.")
-        
-    # 1. Инициализация БД
     init_db()
-    
-    # 2. Построение приложения
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    if not application.job_queue:
-        logger.critical("Не удалось инициализировать JobQueue. Проверьте зависимости.")
-        return
+    app = Application.builder().token(BOT_TOKEN).build()
+    jq = app.job_queue
 
-    job_queue = application.job_queue
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("force_dash", force_dash_command))
+    app.add_handler(CommandHandler("online", online_command))
+    if MATPLOTLIB_AVAILABLE: app.add_handler(CommandHandler("chart", chart_command))
+    app.add_handler(CommandHandler("block", block_command))
+    app.add_handler(CommandHandler("unblock", unblock_command))
+    app.add_handler(CommandHandler("test_quota", test_quota_job))
+    app.add_handler(CommandHandler("test_speed", test_speed_command))
+    app.add_handler(CommandHandler("monitoring", monitoring_command))
+    app.add_handler(CommandHandler("active_wg", active_wg_command))
 
-    # 3. Регистрация команд
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("monitoring", monitoring_command))
-    application.add_handler(CommandHandler("active_wg", active_wg_command))
-    application.add_handler(CommandHandler("test_quota", test_quota_job))
-    application.add_handler(CommandHandler("online", online_command))
-    if MATPLOTLIB_AVAILABLE:
-        application.add_handler(CommandHandler("chart", chart_command))
-    application.add_handler(CommandHandler("block", block_command))
-    application.add_handler(CommandHandler("unblock", unblock_command))
+    # Jobs
+    jq.run_repeating(system_alert_job, interval=CHECK_INTERVAL_SECONDS, first=10)
+    jq.run_repeating(traffic_snapshot_job, interval=600, first=30)
+    jq.run_daily(daily_report_job, time=dt_time(hour=21, minute=0, tzinfo=TZ_MOSCOW))
+    
+    # Channel Jobs
+    jq.run_repeating(live_dashboard_job, interval=300, first=10)
+    jq.run_daily(weekly_speedtest_job, time=dt_time(hour=15, minute=0, tzinfo=TZ_MOSCOW), days=(6,))
+    jq.run_monthly(monthly_public_report_job, when=dt_time(hour=12, minute=0, tzinfo=TZ_MOSCOW), day=1)
+    jq.run_daily(payment_reminder_job, time=dt_time(hour=12, minute=0, tzinfo=TZ_MOSCOW))
+    jq.run_daily(cleanup_old_data_job, time=dt_time(hour=4, minute=0, tzinfo=TZ_MOSCOW))
 
-    # 4. Планирование задач
-    
-    # А. Мониторинг ресурсов: раз в 60 сек
-    job_queue.run_repeating(system_alert_job, interval=CHECK_INTERVAL_SECONDS, first=10)
-    
-    # Б. Снэпшот трафика: раз в 10 минут (600 сек)
-    job_queue.run_repeating(traffic_snapshot_job, interval=600, first=30)
-    
-    # В. Ежедневный отчет в 21:00 МСК
-    report_time = dt_time(hour=21, minute=0, tzinfo=TZ_MOSCOW)
-    job_queue.run_daily(daily_report_job, time=report_time)
-    
-    # Г. Напоминание об оплате
-    reminder_check_time = dt_time(hour=12, minute=0, tzinfo=TZ_MOSCOW)
-    job_queue.run_daily(payment_reminder_job, time=reminder_check_time)
-    
-    #
-    # Д. Ежедневная очистка БД в 04:00 МСК
-    #
-    cleanup_time = dt_time(hour=4, minute=0, tzinfo=TZ_MOSCOW)
-    job_queue.run_daily(cleanup_old_data_job, time=cleanup_time)
-
-
-    # 5. Запуск
-    logger.info("Бот запущен и готов к работе.")
-    application.run_polling()
+    logger.info("Bot v3.0 Started")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
