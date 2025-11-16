@@ -3,3 +3,4 @@ psutil
 pytz
 matplotlib
 python-dotenv
+speedtest-cli
