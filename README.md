@@ -44,7 +44,7 @@ sudo apt install python3 python3-venv python3-pip wireguard-tools speedtest-cli
 ### 2. Клонирование и установка Python-пакетов
 
 ```bash
-git clone [https://github.com/yessshka/tele-monitor.git](https://github.com/yessshka/tele-monitor.git)
+git clone https://github.com/yessshka/tele-monitor.git
 cd tele-monitor
 python3 -m venv venv
 source venv/bin/activate
