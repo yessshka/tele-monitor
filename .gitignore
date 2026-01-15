@@ -1,5 +1,25 @@
-.env
-__pycache__/
+Виртуальное окружение
+
+/bot/
+venv/
+*.venv/
+
+Файлы Python
+
+pycache/
 *.pyc
+
+Конфиденциальные файлы
+
+config.py
+*.db
+*.db-journal
 *.log
-bot/__pycache__/
+
+Файл секретов
+
+.env
+
+Временные файлы
+
+*.png
